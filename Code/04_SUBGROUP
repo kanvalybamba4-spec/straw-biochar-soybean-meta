@@ -1,0 +1,221 @@
+# ==============================================================
+# SUBGROUP FOREST PLOT - BIOCHAR vs STRAW (MIXTURE EXCLUDED)
+# Combined pipeline: (1) compute pooled lnRR per outcome x
+# moderator x level x amendment from Bookfull_soiltype_4class.xlsx,
+# (2) export Subgroup_estimates.csv (usable as a verifiable
+# supplementary table), (3) draw the forest figure.
+#
+# Input : Bookfull_soiltype_4class.xlsx (sheet "clean_data"),
+#         which contains the recoded soil_type column.
+# Outputs: Subgroup_estimates.csv, Subgroup_forest_Biochar_Straw.pdf,
+#          Subgroup_forest_Biochar_Straw.png (600 dpi).
+#
+# ==============================================================
+# --- 1. PACKAGES ---
+packages <- c("metafor", "readxl", "dplyr", "ggplot2")
+new_pkgs <- packages[!(packages %in% installed.packages()[,"Package"])]
+if(length(new_pkgs)) install.packages(new_pkgs)
+library(metafor); library(readxl); library(dplyr); library(ggplot2)
+
+# --- 2. CONFIGURATION ---
+output_dir <- "C:/Users/OMEN/Desktop/4eme"
+input_file <- "Bookfull_soiltype_4class.xlsx"
+
+# --- 3. READ DATA ---
+df <- read_excel(file.path(output_dir, input_file), sheet = "clean_data")
+df <- df %>% filter(!is.na(yi), !is.na(vi), vi > 0,
+                    amendment_type %in% c("Biochar", "Straw"))
+cat("Rows kept:", nrow(df), "\n")
+
+# --- 4. BINNING RULES (thresholds fixed a priori) ---
+bin_N   <- function(x) case_when(x == 0 ~ "N0",
+                                 x < 75 ~ "Low (<75)",
+                                 x <= 150 ~ "Medium (75-150)",
+                                 TRUE ~ "High (>150)")
+bin_SOC <- function(x) case_when(x <= 10 ~ "Low (<=10)",
+                                 x <= 20 ~ "Medium (10-20)",
+                                 TRUE ~ "High (>20)")
+bin_pH  <- function(x) case_when(x <= 6.5 ~ "Acid (<=6.5)",
+                                 x < 7.5 ~ "Neutral (6.5-7.5)",
+                                 TRUE ~ "Alkaline (>=7.5)")
+bin_dur <- function(x) case_when(x <= 3 ~ "Short (<=3)",
+                                 x <= 5 ~ "Medium (3-5)",
+                                 TRUE ~ "Long (>5)")
+bin_MAT <- function(x) case_when(x <= 10 ~ "<=10",
+                                 x <= 20 ~ "10-20",
+                                 TRUE ~ ">20")
+bin_MAP <- function(x) case_when(x <= 600 ~ "<=600",
+                                 x <= 1000 ~ "600-1000",
+                                 TRUE ~ ">1000")
+
+# --- 5. LONG DATA (one row per observation per moderator) ---
+mk <- function(dat, mod, lv) {
+  dat %>% transmute(Outcome = Variable, Moderator = mod,
+                    Level = lv, Amendment = amendment_type, yi = yi, vi = vi)
+}
+long <- bind_rows(
+  mk(df, "N fertilizer rate", bin_N(df$N_rate)),
+  mk(df, "Initial SOC",       bin_SOC(df$initial_SOC)),
+  mk(df, "Soil pH",           bin_pH(df$soil_pH)),
+  mk(df, "Exp duration",      bin_dur(df$exp_duration)),
+  mk(df, "MAT",               bin_MAT(df$MAT)),
+  mk(df, "MAP",               bin_MAP(df$MAP)),
+  mk(df, "Soil type",         df$soil_type)
+) %>% filter(!is.na(Level))
+
+# --- 6. ROBUST MODEL FITTING PER CELL ---
+# REML -> REML (reduced step) -> FE, with the estimator recorded.
+fit_cell <- function(sub) {
+  if(nrow(sub) < 2) {
+    res <- rma(yi = yi, vi = vi, data = sub, method = "FE")
+    return(list(res = res, model = "FE"))
+  }
+  res <- try(rma(yi = yi, vi = vi, data = sub, method = "REML"),
+             silent = TRUE)
+  if(!inherits(res, "try-error")) return(list(res = res, model = "REML"))
+
+  res2 <- try(rma(yi = yi, vi = vi, data = sub, method = "REML",
+                  control = list(stepadj = 0.5, maxiter = 1000)),
+              silent = TRUE)
+  if(!inherits(res2, "try-error")) return(list(res = res2, model = "REML"))
+
+  res3 <- rma(yi = yi, vi = vi, data = sub, method = "FE")
+  return(list(res = res3, model = "FE"))
+}
+
+ests <- long %>%
+  group_by(Outcome, Moderator, Level, Amendment) %>%
+  group_modify(~ {
+    fit <- fit_cell(.x)
+    res <- fit$res
+    tibble(k       = nrow(.x),
+           model   = fit$model,
+           estimate = as.numeric(res$b[1]),
+           ci.lb    = res$ci.lb,
+           ci.ub    = res$ci.ub,
+           pval     = res$pval,
+           I2       = round(res$I2, 1),
+           tau2     = round(res$tau2, 6))
+  }) %>%
+  ungroup()
+
+# --- 7. EXPORT CSV (rounds to manuscript precision) ---
+ests_out <- ests %>%
+  mutate(across(c(estimate, ci.lb, ci.ub), ~ round(.x, 3)),
+         pval = round(pval, 4))
+write.csv(ests_out, file.path(output_dir, "Subgroup_estimates.csv"),
+          row.names = FALSE)
+cat("Subgroup_estimates.csv saved (", nrow(ests_out), " rows)\n")
+cat("Models used:\n"); print(table(ests$model))
+
+# --- 8. SANITY CHECK: k sums must match global amendment totals ---
+chk <- ests %>% group_by(Outcome, Amendment) %>%
+  summarise(total_k = sum(k), .groups = "drop")
+print(as.data.frame(chk))
+
+# ==============================================================
+# FIGURE
+# ==============================================================
+# --- 9. READ ESTIMATES BACK (CSV is the single source for the plot) ---
+obs <- read.csv(file.path(output_dir, "Subgroup_estimates.csv"),
+                stringsAsFactors = FALSE)
+obs$lnRR <- obs$estimate
+obs$Amendment <- factor(obs$Amendment, levels = c("Biochar", "Straw"))
+
+# --- 10. SLOT GRID (2 sub-rows per level) ---
+mod_order <- c("N fertilizer rate", "Initial SOC", "Soil pH", "Exp duration",
+               "MAT", "MAP", "Soil type")
+lvl_list <- list(
+  "N fertilizer rate" = c("N0", "Low (<75)", "Medium (75-150)", "High (>150)"),
+  "Initial SOC"        = c("Low (<=10)", "Medium (10-20)", "High (>20)"),
+  "Soil pH"            = c("Acid (<=6.5)", "Neutral (6.5-7.5)", "Alkaline (>=7.5)"),
+  "Exp duration"       = c("Short (<=3)", "Medium (3-5)", "Long (>5)"),
+  "MAT"                = c("<=10", "10-20", ">20"),
+  "MAP"                = c("<=600", "600-1000", ">1000"),
+  "Soil type"          = c("Black soil", "Loam", "Clayey", "Sandy"))
+amend_order <- c("Biochar", "Straw")
+
+build_grid <- function() {
+  rec <- list(); lvlrec <- list(); band <- list()
+  y <- 1
+  for(m in mod_order) {
+    m_first <- y; m_last <- y
+    for(lv in lvl_list[[m]]) {
+      lvl_start <- y
+      for(am in amend_order) {
+        rec[[length(rec)+1]] <- data.frame(Moderator = m, Level = lv,
+                                           Amendment = am, ypos = y)
+        m_last <- y; y <- y + 1
+      }
+      lvlrec[[length(lvlrec)+1]] <- data.frame(Moderator = m, Level = lv,
+                                               y = lvl_start + 0.5)
+      y <- y + 0.6
+    }
+    band[[length(band)+1]] <- data.frame(Moderator = m,
+                                         ymin = m_first - 0.5, ymax = m_last + 0.5,
+                                         y = (m_first + m_last) / 2)
+    y <- y + 1.2
+  }
+  list(grid = do.call(rbind, rec), lvls = do.call(rbind, lvlrec),
+       bands = do.call(rbind, band))
+}
+G <- build_grid()
+grid0 <- G$grid; lvlz <- G$lvls; bands <- G$bands
+grid <- rbind(transform(grid0, Outcome = "SOC"), transform(grid0, Outcome = "Yield"))
+plot_df <- left_join(grid, obs, by = c("Outcome", "Moderator", "Level", "Amendment"))
+
+panels <- data.frame(Outcome = c("Yield", "SOC"),
+                     Panel = factor(c("(a) Crop yield", "(b) Soil organic carbon"),
+                                    levels = c("(a) Crop yield", "(b) Soil organic carbon")))
+plot_df <- left_join(plot_df, panels, by = "Outcome")
+bands2 <- merge(bands, panels, by = NULL)
+mod_lab <- merge(bands[, c("Moderator", "y")], panels, by = NULL)
+seps <- data.frame(y = lvlz$y + 0.8)
+
+# --- 11. COLORS ---
+amend_pal <- c("Biochar" = "#C0392B", "Straw" = "#E67E22")
+band_cols <- c("N fertilizer rate" = "#E41A1C", "Initial SOC" = "#FF7F00",
+               "Soil pH" = "#377EB8", "Exp duration" = "#4DAF4A", "MAT" = "#984EA3",
+               "MAP" = "#F781BF", "Soil type" = "#1ABC9C")
+bands2$fill <- band_cols[bands2$Moderator]
+
+# --- 12. PLOT ---
+p <- ggplot(plot_df, aes(x = lnRR, y = ypos)) +
+  geom_rect(data = bands2,
+            aes(xmin = -Inf, xmax = Inf, ymin = ymin, ymax = ymax, fill = fill),
+            colour = "grey50", linewidth = 0.3, alpha = 0.22, inherit.aes = FALSE) +
+  scale_fill_identity() +
+  geom_hline(data = seps, aes(yintercept = y), linetype = "dashed",
+             colour = "grey60", linewidth = 0.3) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey30", linewidth = 0.4) +
+  geom_errorbarh(aes(xmin = ci.lb, xmax = ci.ub, colour = Amendment),
+                 height = 0.1, linewidth = 0.5) +
+  geom_point(aes(colour = Amendment), shape = 15, size = 2.4) +
+  geom_text(aes(x = ci.ub, label = paste0("n=", k), colour = Amendment),
+            hjust = -0.15, size = 2.3, show.legend = FALSE) +
+  geom_text(data = mod_lab, aes(x = -0.015, y = y, label = Moderator),
+            hjust = 1, size = 3.1, fontface = "bold", colour = "black",
+            inherit.aes = FALSE) +
+  scale_colour_manual(values = amend_pal, name = "Amendment type") +
+  facet_wrap(~ Panel, nrow = 1) +
+  scale_y_continuous(breaks = lvlz$y, labels = lvlz$Level, trans = "reverse") +
+  scale_x_continuous(breaks = seq(0, 0.4, 0.1)) +
+  coord_cartesian(xlim = c(-0.18, 0.48), clip = "off") +
+  labs(x = "Effect size (lnRR with 95% CI)", y = NULL) +
+  theme_bw(base_size = 11, base_family = "Times") +
+  theme(strip.text = element_text(face = "bold", size = 10),
+        strip.background = element_rect(fill = "grey85", colour = "grey50"),
+        panel.grid = element_blank(),
+        axis.text.y = element_text(size = 8.7, colour = "black"),
+        axis.text.x = element_text(size = 9),
+        legend.position = "bottom",
+        panel.spacing = unit(0.5, "cm"),
+        plot.margin = margin(8, 10, 8, 8))
+print(p)
+
+# --- 13. SAVE ---
+ggsave(file.path(output_dir, "Subgroup_forest_Biochar_Straw.pdf"),
+       p, width = 10, height = 10, units = "in")
+ggsave(file.path(output_dir, "Subgroup_forest_Biochar_Straw.png"),
+       p, width = 10, height = 10, units = "in", dpi = 600)
+cat("\n=== DONE ===\n")
