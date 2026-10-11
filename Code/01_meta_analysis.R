@@ -57,9 +57,6 @@ yield_dat <- data.frame(
 yield_dat <- yield_dat[!is.na(yield_dat$yi) & !is.na(yield_dat$Treatment), ]
 yield_dat$Treatment <- trimws(yield_dat$Treatment)
 
-# Missing or non-positive sampling variances are replaced with half the
-# minimum observed variance, so that all extracted studies can be retained
-# in the model. This choice is applied identically to every treatment and
 # is stated here for full transparency.
 yield_dat$vi[is.na(yield_dat$vi) | yield_dat$vi <= 0] <-
   min(yield_dat$vi[yield_dat$vi > 0], na.rm = TRUE) * 0.5
@@ -111,7 +108,7 @@ meta_all   <- rbind(meta_yield, meta_soc)
 cat("\n=== META-ANALYSIS RESULTS ===\n")
 print(meta_all, row.names = FALSE)
 
-# --- 8. PLOT FUNCTION : CLEAN LABELS, FIXED POINT SIZE ---
+# --- 8. PLOT FUNCTION 
 plot_es <- function(meta_res, title_text, color_palette) {
   meta_res$Treatment <- factor(meta_res$Treatment,
                                levels = c("Biochar", "Straw", "Mixture"))
